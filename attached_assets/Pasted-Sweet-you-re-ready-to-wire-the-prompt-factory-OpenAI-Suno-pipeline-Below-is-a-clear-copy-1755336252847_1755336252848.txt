@@ -1,0 +1,340 @@
+Sweet — you’re ready to wire the **prompt factory → OpenAI → Suno** pipeline. Below is a clear, copy-pasteable path to get this running in your Replit today.
+
+---
+
+# 0) What we’ll build
+
+A tiny FastAPI backend with two endpoints:
+
+* `POST /generate-song` → takes `genre + intensity + smackStyle + opponent + players`, asks OpenAI for a Suno-ready **title + style blurb + 2-verse lyrics** (with your safety rules), then sends it to Suno to start generation. Returns a `taskId`.
+* `GET /suno-status?taskId=...` → polls Suno until audio URLs are ready and returns them.
+
+We’ll also randomize **sub-genres** per request (e.g., Rap → Trap/Drill/Plugg/etc).
+
+---
+
+# 1) Get API access
+
+**OpenAI**
+
+1. Create an API key in your OpenAI dashboard.
+2. You’ll use the Responses/Chat API to get **structured JSON** (title/style/lyrics). OpenAI supports “Structured Outputs” with JSON Schema if you want it to be 100% machine-parsable. ([OpenAI Platform][1])
+
+**Suno**
+
+* If you have **official Suno API** access in your account, use that. Otherwise you can use the **Suno API service at `api.sunoapi.org`** shown below (3rd-party; keep an eye on rate limits, credits, and ToS).
+* The docs below show the `POST /api/v1/generate` and `GET /api/v1/generate/record-info` flow we’ll call. ([Suno API Documentation][2])
+
+---
+
+# 2) Replit setup
+
+1. Create a new Python Repl.
+2. Add secrets (Replit: Tools → Secrets):
+
+   * `OPENAI_API_KEY=...`
+   * `SUNO_API_KEY=...` (from your Suno provider/dashboard)
+   * Optional: `SUNO_BASE=https://api.sunoapi.org` and `SUNO_MODEL=V4_5`
+3. Install deps (Shell):
+
+```bash
+pip install fastapi uvicorn[standard] openai requests pydantic python-dotenv
+```
+
+---
+
+# 3) Drop in this backend (`app.py`)
+
+> Paste the whole file into `app.py` and click “Run”.
+
+```python
+import os, random, json, time
+from typing import List, Literal, Optional, Dict
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+from openai import OpenAI
+
+# ---------- CONFIG ----------
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # swap to gpt-5 if your account has it
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+SUNO_BASE = os.getenv("SUNO_BASE", "https://api.sunoapi.org")
+SUNO_API_KEY = os.environ["SUNO_API_KEY"]
+SUNO_MODEL = os.getenv("SUNO_MODEL", "V4_5")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI(title="Fantasy SmackTalk Prompt Factory")
+
+# ---------- TAXONOMY ----------
+Genre = Literal["rap","country","electronic","pop","rnb","blues","rock","reggae"]
+Intensity = Literal["mild","medium","savage"]
+Smack = Literal["family_fun","casual_roast","wwe","spicy","comedy_gold","personal_digs"]
+
+SUBGENRES: Dict[str, List[str]] = {
+    "rap": ["trap","90s boom bap","drill","plugg","west coast"],
+    "country": ["bluegrass","outlaw","stadium","honky-tonk","country pop"],
+    "electronic": ["house","edm festival","dubstep","techno","future bass"],
+    "pop": ["bubblegum pop","dance pop","indie pop","synthpop","pop rock"],
+    "rnb": ["neo-soul","2000s r&b","bedroom r&b","funk r&b","trap-soul"],
+    "blues": ["delta","chicago","texas","soul blues","rock blues"],
+    "rock": ["punk rock","classic rock","grunge","garage rock","pop punk"],
+    "reggae": ["roots","dancehall","reggaeton","dub","ska"],
+}
+
+GENRE_STYLE_GUIDE = {
+    "rap": "Hard 808s, crisp hi-hats; confident battle-rap delivery; rhyme-dense bars.",
+    "country": "Twangy guitars, steady stomps, singalong hooks; playful honky-tonk spirit.",
+    "electronic": "Four-on-the-floor drive, modern synths, energetic drops; festival-ready.",
+    "pop": "Catchy hook-forward structure; glossy synths; radio-friendly shine.",
+    "rnb": "Smooth chords, soulful phrasing, groovy bass; melodic ad-libs.",
+    "blues": "Shufflin’ groove, guitar licks, smoky bar energy; call-and-response.",
+    "rock": "Distorted power chords, driving drums; chantable, high-energy choruses.",
+    "reggae": "Laid-back offbeat skank, warm bass; relaxed but cutting vocal delivery."
+}
+
+INTENSITY_TONE = {
+    "mild": "Playful banter and friendly competition.",
+    "medium": "Confident swagger with a competitive edge—clever, not cruel.",
+    "savage": "Ruthless, dominant, no mercy—still within content rules."
+}
+
+SMACK_RULES = {
+    "family_fun": "Keep it PG and wholesome, silly jabs and clean phrases.",
+    "casual_roast": "Classic fantasy football roast—witty put-downs, no extremes.",
+    "wwe": "Over-the-top, larger-than-life threats and victory talk like a promo.",
+    "spicy": "NSFW with explicit language and adult humor; raunchy jokes allowed.",
+    "comedy_gold": "Pop culture gags and meme-worthy lines; NO quoting real song lyrics.",
+    "personal_digs": "Petty, childish taunts about fantasy choices, benches, and trades."
+}
+
+# ---------- INPUT MODELS ----------
+class GenerateSongIn(BaseModel):
+    genre: Genre
+    intensity: Intensity
+    smack_style: Smack
+    opponent_name: str
+    my_team_starters: List[str] = Field(..., description="List of my starters' full names")
+    opp_team_starters: List[str] = Field(..., description="List of opponent starters' full names")
+
+# ---------- PROMPT BUILDING ----------
+def pick_subgenre(genre: str) -> str:
+    return random.choice(SUBGENRES[genre])
+
+def build_openai_messages(payload: GenerateSongIn) -> List[Dict]:
+    sub = pick_subgenre(payload.genre)
+
+    # Hard content rules baked into the system message
+    system = f"""
+You write Suno prompts for fantasy football trash talk songs.
+
+GOALS:
+- Return ONLY valid JSON (no prose).
+- Provide: title, style_prompt, subgenre, bpm, key, lyrics.
+- Lyrics: first-person voice, MAX 2 verses + 1 chorus (chorus can repeat), must include EVERY starter from BOTH teams and the opponent's name at least once.
+
+TONE & STYLE:
+- Main genre: {payload.genre.upper()} ({GENRE_STYLE_GUIDE[payload.genre]})
+- Random sub-genre flavor: {sub}
+- Intensity: {payload.intensity} — {INTENSITY_TONE[payload.intensity]}
+- Smack style: {payload.smack_style} — {SMACK_RULES[payload.smack_style]}
+
+ABSOLUTE RULES:
+- No mentions of injuries, health, or violence.
+- No slurs. No hateful content.
+- No defamatory or false claims; only playful/competitive taunts.
+- Do not reference or quote real song lyrics.
+- Keep under ~2500 characters total.
+- Output JSON only.
+"""
+
+    # Small musical shape knobs. You can tune ranges per genre if you want.
+    bpm = random.choice([72, 80, 88, 92, 100, 110, 120])
+    musical_key = random.choice(["C", "D", "E♭", "E", "F", "G", "A", "B♭"])
+
+    user = {
+        "opponent_name": payload.opponent_name,
+        "my_starters": payload.my_team_starters,
+        "opp_starters": payload.opp_team_starters,
+        "bpm_hint": bpm,
+        "key_hint": musical_key
+    }
+
+    # Make it crystal clear we want JSON back
+    format_hint = {
+        "return_json_with_fields": {
+            "title": "string <= 80 chars",
+            "subgenre": "string",
+            "bpm": "integer",
+            "key": "string",
+            "style_prompt": "short paragraph describing instruments/tempo/melody and performance vibe",
+            "lyrics": {
+                "verse1": "string (lines separated by \\n)",
+                "chorus": "string (lines separated by \\n; may be repeated)",
+                "verse2": "string (lines separated by \\n)"
+            }
+        }
+    }
+
+    return [
+        {"role": "system", "content": system.strip()},
+        {"role": "user", "content": json.dumps({"spec": format_hint, "data": user})}
+    ]
+
+def call_openai_for_song(payload: GenerateSongIn) -> dict:
+    """
+    Uses JSON mode to force a clean JSON body back.
+    You can upgrade to Structured Outputs (JSON Schema) later if you like.
+    """
+    messages = build_openai_messages(payload)
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        response_format={"type": "json_object"},
+        messages=messages,
+        temperature=0.9,
+    )
+    raw = resp.choices[0].message.content
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI returned non-JSON: {raw[:200]} ...")
+
+# ---------- SUNO CLIENT ----------
+def suno_generate(title: str, style_prompt: str, lyrics_text: str) -> str:
+    """
+    Kicks off generation and returns taskId.
+    """
+    url = f"{SUNO_BASE}/api/v1/generate"
+    headers = {
+        "Authorization": f"Bearer {SUNO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "prompt": lyrics_text,         # send the full lyrics here
+        "style": style_prompt,         # your production guide
+        "title": title,
+        "customMode": True,
+        "instrumental": False,
+        "model": SUNO_MODEL,
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Suno error: {r.text}")
+    data = r.json()
+    if data.get("code") != 200:
+        raise HTTPException(status_code=502, detail=f"Suno generation failed: {data}")
+    return data["data"]["taskId"]
+
+def suno_status(task_id: str) -> dict:
+    url = f"{SUNO_BASE}/api/v1/generate/record-info"
+    headers = {"Authorization": f"Bearer {SUNO_API_KEY}"}
+    r = requests.get(url, headers=headers, params={"taskId": task_id}, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Suno status error: {r.text}")
+    return r.json()
+
+# ---------- ROUTES ----------
+@app.post("/generate-song")
+def generate_song(in_: GenerateSongIn):
+    song = call_openai_for_song(in_)
+    # Flatten lyrics into a single block for the prompt body
+    lyrics_text = "\n\n".join([
+        song["lyrics"]["verse1"].strip(),
+        "[Chorus]\n" + song["lyrics"]["chorus"].strip(),
+        song["lyrics"]["verse2"].strip()
+    ])
+    task_id = suno_generate(song["title"], song["style_prompt"], lyrics_text)
+    return {
+        "taskId": task_id,
+        "openai_result": song  # keep for debug/preview in UI
+    }
+
+@app.get("/suno-status")
+def suno_task_status(taskId: str = Query(...)):
+    return suno_status(taskId)
+
+# Replit runner
+# uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+**Run it**
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+# 4) How your front-end should call it
+
+**Create song**
+
+```bash
+curl -X POST http://localhost:8000/generate-song \
+  -H "Content-Type: application/json" \
+  -d '{
+    "genre": "rap",
+    "intensity": "savage",
+    "smack_style": "spicy",
+    "opponent_name": "Jordan",
+    "my_team_starters": ["Patrick Mahomes","Bijan Robinson","CeeDee Lamb","Mark Andrews","..."],
+    "opp_team_starters": ["Josh Allen","Saquon Barkley","Amon-Ra St. Brown","Kyle Pitts","..."]
+  }'
+```
+
+→ You’ll get `{ "taskId": "xxxxx", "openai_result": {...} }`.
+
+**Poll for audio URLs**
+
+```bash
+curl "http://localhost:8000/suno-status?taskId=xxxxx"
+```
+
+Look for `data.response.sunoData[0].audioUrl` (stream URL shows up first; full MP3 a bit later). ([Suno API Documentation][3])
+
+---
+
+# 5) Guardrails baked into the prompt
+
+* Always **first-person voice**.
+* **Every starter’s name** on both teams + **opponent name** at least once.
+* **Max 2 verses (+ chorus)**.
+* **No injuries, no slurs, no false/defamatory claims**, no quoting real song lyrics (Comedy Gold can reference pop culture generically).
+* **Spicy** mode unlocks explicit language; others stay within their tone rules.
+
+These constraints are enforced in the **system message** and the JSON return shape. (You can hard-enforce structure with OpenAI **Structured Outputs**/JSON Schema if you want 100% guaranteed keys.) ([OpenAI Platform][1])
+
+---
+
+# 6) Random sub-genre flavor
+
+We pick a sub-genre per request and blend it into `style_prompt` (e.g., **Rap → Drill** adds “sliding 808s + ominous piano”). You can expand `SUBGENRES` and optionally map each sub-genre to its own micro-descriptor if you want even more variety.
+
+---
+
+# 7) Tips, limits, and production notes
+
+* **OpenAI**: JSON mode / Structured Outputs keep responses parseable; choose a model that’s cost-effective for your traffic. ([OpenAI Platform][1])
+* **Suno**: Each `generate` returns **2 songs**; stream URLs arrive in \~30–40s and downloadable links in \~2–3min (don’t hammer the poll endpoint; poll every 20–30s or use webhooks). Default concurrency is **20 requests per 10 seconds**. ([Suno API Documentation][2])
+* **Errors**: Handle statuses like `PENDING`, `TEXT_SUCCESS`, `FIRST_SUCCESS`, `SUCCESS`, and `SENSITIVE_WORD_ERROR`. If the latter hits for Spicy mode, re-roll with slightly toned-down phrasing. ([Suno API Documentation][3])
+* **Content toggles**: You already have PG/NSFW in the UI; pass `smack_style` straight through so the prompt knows whether to be clean or explicit.
+
+---
+
+# 8) Optional: switch to fully-strict JSON Schema
+
+If you want **guaranteed structure**, swap the OpenAI call to **Structured Outputs** (Responses API) with a JSON Schema. (Docs: Structured Outputs + Responses API.) ([OpenAI Platform][1])
+
+---
+
+## You're set
+
+Wire your UI buttons to `POST /generate-song`, then poll `/suno-status` and drop the returned audio URL into your player. If you want, I can also give you:
+
+* a small **TypeScript/React** client snippet for your current UI,
+* or upgrade the OpenAI call to strict **JSON Schema**.
+
+[1]: https://platform.openai.com/docs/guides/structured-outputs?utm_source=chatgpt.com "Structured model outputs - OpenAI API"
+[2]: https://docs.sunoapi.org/suno-api/generate-music "Generate Suno AI Music - Suno API"
+[3]: https://docs.sunoapi.org/suno-api/get-music-generation-details "Get Music Generation Details - Suno API"

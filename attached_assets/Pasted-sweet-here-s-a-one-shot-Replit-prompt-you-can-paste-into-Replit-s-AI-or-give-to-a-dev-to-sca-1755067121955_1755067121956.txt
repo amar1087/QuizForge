@@ -1,0 +1,382 @@
+sweet — here’s a **one-shot Replit prompt** you can paste into Replit’s AI (or give to a dev) to scaffold the MVP **song-only** app with a shiny frontend, OCR roster parsing from screenshots, Suno song generation, 15-sec preview, Stripe paywall for the full MP3, PG/NSFW toggle, and built-in scale patterns (queue, retries, caching).
+
+---
+
+## 🧪 Copy-paste this into Replit (single prompt)
+
+> Build a production-ready web app named **TrashTalk Anthems** with the following spec. Use **Next.js 14 (App Router) + TypeScript + TailwindCSS + shadcn/ui + Radix + Framer Motion** for a sleek UI with animations, gradients, glassmorphism, and micro-interactions (hover, press, focus).
+> Use **Stripe Checkout** (one-time purchase) to unlock the full MP3 download.
+> Use **Supabase** (Postgres + Auth + Storage) for persistence and signed URLs.
+> Use **Upstash Redis + BullMQ** for a job queue.
+> Use **ffmpeg-static** for audio slicing (15s preview).
+> Use **tesseract.js** for OCR of roster screenshots (client → worker).
+> Integrate **Suno AI** via a server action wrapper (`/lib/suno.ts`)—use an environment variable `SUNO_API_KEY` and the following interface; if Suno’s exact endpoint differs, leave the wrapper with `TODO` notes and mock with a predictable contract to keep the code building/runnable.
+
+---
+
+### 0) Project setup
+
+* Next.js 14 with App Router, `src/` structure, TypeScript strict.
+* Tailwind + shadcn/ui (Buttons, Cards, Inputs, Select, Toggle, Switch, Tooltip, Skeleton, Toast).
+* Framer Motion for entrance/hover animations.
+* ESLint + Prettier.
+* Environment with `dotenv` and `schema.d.ts`.
+
+### 1) ENV variables
+
+Create `.env.local.example` and load via Next.js runtime:
+
+```
+NEXT_PUBLIC_SITE_URL=http://localhost:3000
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_PRICE_ID=price_...
+SUPABASE_URL=...
+SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+UPSTASH_REDIS_URL=...
+UPSTASH_REDIS_TOKEN=...
+SUNO_API_KEY=...
+```
+
+### 2) Data model (Supabase / Postgres)
+
+Use Prisma or Drizzle (your choice, prefer Drizzle). Tables:
+
+* `users` (if using Supabase Auth; otherwise allow guest flows)
+* `jobs`:
+
+  * `id` (uuid, pk)
+  * `status` (`queued|processing|succeeded|failed`)
+  * `input_hash` (text, indexed) — SHA256 of normalized user inputs for caching
+  * `team_name` (text)
+  * `opponent_team_name` (text)
+  * `your_roster_raw` (jsonb) — from OCR/parsing + manual corrections
+  * `opponent_roster_raw` (jsonb)
+  * `genre` (enum: country|rap|electronic|pop|blues|funk|rnb|gospel)
+  * `tone` (enum: mild|medium|savage)
+  * `persona` (enum: first\_person|narrator)
+  * `rating_mode` (enum: PG|NSFW)
+  * `stripe_session_id` (text, nullable)
+  * `suno_request_id` (text, nullable)
+  * `lyrics` (text, nullable)
+  * `lyrics_lrc` (text, nullable)
+  * `mp3_path` (text, nullable) — Supabase Storage path
+  * `preview_mp3_path` (text, nullable)
+  * `duration_sec` (int, nullable)
+  * `created_at` (timestamptz, default now)
+  * `updated_at` (timestamptz)
+* `purchases`:
+
+  * `id` (uuid, pk)
+  * `job_id` (uuid, fk -> jobs)
+  * `user_id` (nullable if guest)
+  * `stripe_session_id` (text, unique)
+  * `amount` (int)
+  * `created_at`
+
+Create SQL migration and Drizzle/Prisma models.
+
+### 3) Storage buckets (Supabase)
+
+* Bucket `audio` (private) for full MP3s.
+* Bucket `previews` (public or signed short-lived) for 15s previews.
+* Signed URL helper in `/lib/storage.ts`.
+
+### 4) Job queue
+
+* Configure **BullMQ** backed by **Upstash Redis**.
+
+* Queues: `song-generate` (priority 1).
+
+* Worker at `src/queue/worker.ts`:
+
+  * Steps:
+
+    1. Normalize inputs and compute `input_hash`.
+    2. Cache check: if job with same hash is already succeeded, return existing assets (idempotent).
+    3. **Lyrics generation prompt** (see template below) → call `generateLyrics()` (server function).
+    4. Call `suno.generateSong({ lyrics, genre, persona, tone, ratingMode })` – wrapper in `/lib/suno.ts`.
+    5. Poll for completion. On success, fetch MP3 buffer + duration. Store full MP3 to Supabase `audio/…`.
+    6. Use **ffmpeg-static** to render a 15-second preview (fade in/out 200ms). Store preview to `previews/…`.
+    7. Optionally generate a naive LRC (evenly distribute lines across duration) if Suno doesn’t give timestamps.
+    8. Update `jobs` with paths, lyrics, lrc, duration, status = `succeeded`.
+
+* Retry policy: `attempts: 3`, backoff exponential (min 5s, max 60s). Mark `failed` with error snapshot.
+
+### 5) API routes (Next.js App Router)
+
+* `POST /api/jobs` — create job (guest or authed):
+
+  * body: `{ teamName, opponentTeamName, yourRosterImage, opponentRosterImage, genre, tone, persona, ratingMode, (optional) manualRosters }`
+  * Steps: upload images to Supabase (if provided), run OCR client-side first (see below), send parsed data; server still validates.
+  * Enqueue `song-generate`; return `{ jobId }`.
+
+* `GET /api/jobs/[id]` — status poll:
+
+  * returns `{ status, previewUrl (if ready), lyricsSnippet, errors? }`.
+
+* `POST /api/checkout` — create Stripe Checkout Session:
+
+  * body: `{ jobId }`
+  * creates session with `mode=payment`, `line_items=[{price: STRIPE_PRICE_ID, quantity: 1}]`, `success_url`, `cancel_url`.
+  * attach `jobId` in `metadata`.
+
+* `POST /api/stripe/webhook` — handle payment success:
+
+  * verify signature, on `checkout.session.completed`:
+
+    * record in `purchases`, link to `jobId`.
+    * allow `/api/download?jobId=…` for that session’s user (via signed URL).
+
+* `GET /api/preview?jobId=...` — returns signed URL (short-lived) to preview MP3 if `status=succeeded`.
+
+* `GET /api/download?jobId=...` — require purchase check → signed URL to full MP3.
+
+### 6) Suno wrapper (`/lib/suno.ts`)
+
+Create a typed module with placeholders:
+
+```ts
+export type SunoGenerateParams = {
+  lyrics: string;
+  genre: 'country'|'rap'|'electronic'|'pop'|'blues'|'funk'|'rnb'|'gospel';
+  persona: 'first_person'|'narrator';
+  tone: 'mild'|'medium'|'savage';
+  ratingMode: 'PG'|'NSFW';
+  durationSec?: number; // we’ll accept Suno’s default, param optional
+};
+
+export type SunoGenerateResult = {
+  requestId: string;
+};
+
+export type SunoPollResult = {
+  status: 'queued'|'processing'|'succeeded'|'failed';
+  mp3Buffer?: ArrayBuffer;
+  durationSec?: number;
+  lyrics?: string; // if provided
+  // If Suno gives timestamps, include structured lyric timing here
+};
+
+export async function generateSong(p: SunoGenerateParams): Promise<SunoGenerateResult> {
+  // TODO: Call Suno API with headers { Authorization: Bearer SUNO_API_KEY }
+  // Submit lyrics + style tokens derived from genre/tone/persona.
+  return { requestId: 'mock_' + crypto.randomUUID() };
+}
+
+export async function pollSong(requestId: string): Promise<SunoPollResult> {
+  // TODO: Poll Suno job until complete; For dev, mock success with test MP3.
+  return { status: 'succeeded', mp3Buffer: new ArrayBuffer(0), durationSec: 45 };
+}
+```
+
+### 7) Lyrics generation (`/lib/lyrics.ts`)
+
+* Implement `buildLyricsPrompt(inputs)` and `generateLyrics(inputs)` that calls your LLM (optional) OR rule-based template. For cost/control in MVP, do **templated composition** with randomized phrasings.
+* **Hard constraints**:
+
+  * **Name every starter on both teams** (use OCR-parsed list; if some names fail OCR, show an editable list before submission).
+  * **No slurs / no injuries / no personal attacks** (fantasy performance, stats-ish taunts OK).
+  * Support **persona**: `first_person` (“we/us”) vs `narrator`.
+  * **Tone**: mild/medium/savage; savage still clean of disallowed themes.
+  * **Rating**: PG vs NSFW toggles profanity level; block slurs always.
+
+**Template (example):**
+
+```
+[INTRO – hype up {teamName}]
+{teamName} marching in, set the tone, lights low, crowd loud,
+We got {YourQB}, {YourRB1}, {YourWR1}, stacking points, make you proud.
+
+[VERSE 1 – your stars shining, list rest of your starters]
+{YourWR2} down the seam, {YourTE} on a post, chains moving quick,
+{YourK} splits the uprights, DEF breathing down necks, that pick-six click.
+
+[HOOK – chant]
+{teamName}! {teamName}! Scoreboard’s gonna tell it plain,
+{opponentTeamName}, buckle up — this week’s bringing pain.
+
+[VERSE 2 – opponent underperforms, name all their starters]
+{OppQB} seeing ghosts, {OppRB1} stuffed in the lane,
+{OppWR1} locked up tight, {OppWR2} stuck in the rain.
+{OppTE} drops in traffic, {OppK} shanks wide left,
+That {OppDEF} looks lost — under pressure, out of breath.
+
+[OUTRO – respectful but spicy]
+Good game, talk big, we’re here to play not preach,
+When the clock hits zero — it’s {teamName} on the beach.
+```
+
+* Build variations per **genre** (rhyme density, vernacular), **tone**, and **rating**.
+
+* Ensure **every starter** appears exactly once; fallback lines (e.g., “{PlayerName} takes the top off”) per position.
+
+* **LRC generator**: if no timestamps from Suno, split lyrics into lines and assign cumulative time slots over `durationSec`, with ≤2s per short line and ≤4s per long line; export `.lrc` string.
+
+### 8) OCR (client-side) + roster parsing
+
+* On the client, when the user uploads screenshots for **your roster** and **opponent roster**, run **tesseract.js** in a web worker.
+* Extract candidate player names with heuristics:
+
+  * Remove team abbreviations, positions, projected points.
+  * Use a preloaded list of NFL player names for 2025 season for fuzzy matching (bundle a JSON list; simple Fuse.js).
+* Show an **editable, structured roster UI** (QB, RB, WR, TE, FLEX, K, DEF) with autosuggest. Require each slot filled before “Generate”.
+
+### 9) Frontend (polish)
+
+* **Landing (/)**
+
+  * Hero with animated gradient, glass card, CTA button (“Make My Anthem”).
+  * Subtle confetti or particle background on hover.
+* **Creator (/create)**
+
+  * Stepper: (1) Team Names → (2) Upload Roster Screenshots → (3) Confirm Parsed Names → (4) Style
+  * Style step: Select **Genre** (dropdown: country, rap, electronic, pop, blues, funk, r\&b, gospel), **Tone** (mild/medium/savage), **Persona** (your team / narrator), **Rating** (PG/NSFW).
+  * Fancy inputs (icons), animated buttons, toasts for parsing success/fail, skeletons while OCR runs.
+  * “Generate Anthem” triggers `/api/jobs` and shows a **realtime job status** widget (SWR polling or server-sent events).
+  * When ready: embedded player for **15-second preview** (signed URL). Visualizer bars using `<canvas>` or CSS animated bars.
+  * “Get Full Song – \$3.99” → Stripe Checkout.
+* **Receipt (/success)**
+
+  * If paid: show “Download Full MP3” (signed URL) + lyrics text. Offer easy **share caption** and hashtags for TikTok/Reels/Reddit.
+* **My Orders (/library)** (optional for MVP)
+
+  * List past purchases (if authed). Guests can receive email link (add simple email capture on checkout).
+
+### 10) Pricing & Stripe
+
+* Hardcode one product/price via `STRIPE_PRICE_ID`.
+* Checkout metadata includes `{ jobId }`.
+* Webhook marks purchase; then `/api/download?jobId=` returns a signed Supabase URL (expiry 24–72h).
+* Handle refunds/retries in a minimal admin page `/admin` (protected by `NEXTAUTH_SECRET` or Supabase RLS).
+
+### 11) Access & auth
+
+* MVP: **guest flow allowed** (no sign-in needed). Store a `clientId` in localStorage for identifying previews vs purchases.
+* Optional: enable Supabase OAuth (Google/Apple) for library.
+
+### 12) Caching & costs
+
+* Before enqueuing, compute `input_hash` of canonicalized payload (team/opponent/rosters/genre/tone/persona/rating). If an identical successful job exists, **return that** to save API costs.
+* Rate-limit per IP/clientId (basic in-memory + Redis token bucket).
+* Circuit breaker if Suno/Stripe/Supabase fail.
+
+### 13) Moderation & safety
+
+* Always strip slurs. Allow profanity if `NSFW`, but maintain a denylist (slurs, hate).
+* Re-generate lyrics if a banned token appears.
+* Keep “no injuries”, “no personal attacks” guardrails in the prompt.
+
+### 14) DX & scripts
+
+* `pnpm dev` / `pnpm build` / `pnpm start`.
+* Seed script to create buckets and policies.
+* Minimal tests for `lyrics.ts` and `lrc` generation.
+* Health endpoint `/api/health`.
+
+### 15) Visual polish notes
+
+* Use **shadcn** Cards with soft shadows, rounded-2xl, subtle borders.
+* Buttons: animated gradient border on hover, press scale 0.98, tooltip microcopy.
+* Loading states: shimmer skeletons and motion fade.
+* Toasts for each step (OCR complete, Job queued, Song ready).
+* Include a small **brand mark** (TT monogram) and **dark mode** default.
+
+---
+
+## Prompt-ready code stubs to include
+
+**/lib/normalize.ts**
+
+```ts
+export function normalizeInputs(payload: any) {
+  // trim strings, lowercase tone/persona, sort rosters by position order
+  // return { normalized, hash }
+}
+```
+
+**/lib/lrc.ts**
+
+```ts
+export function buildNaiveLRC(lyrics: string, durationSec = 45) {
+  // split lines, assign timestamps, return .lrc string
+}
+```
+
+**/lib/storage.ts**
+
+```ts
+export async function putBufferAsFile(path: string, buf: Buffer, bucket: 'audio'|'previews'): Promise<string> {
+  // upload and return storage path
+}
+export async function signedUrl(path: string, bucket: 'audio'|'previews', expiresSec = 600): Promise<string> {
+  // return signed URL via Supabase
+}
+```
+
+**/app/api/jobs/route.ts (POST)**
+
+* Validate payload (zod).
+* Normalize & hash.
+* Insert `jobs` row status=`queued`.
+* Enqueue BullMQ job with `jobId`.
+* Return `{ jobId }`.
+
+**/queue/worker.ts**
+
+* Fetch job row.
+* `generateLyrics(inputs)` → lyrics.
+* `suno.generateSong(...)` → poll → MP3 buffer.
+* Write full MP3 → `audio/...`
+* ffmpeg slice 0–15s → `previews/...`
+* Optional `buildNaiveLRC(...)`.
+* Update DB → `succeeded`.
+
+**/app/api/stripe/webhook/route.ts**
+
+* Verify signature.
+* On `checkout.session.completed`: upsert `purchases`.
+
+**/app/api/preview/route.ts**
+
+* Check job status; return signed preview URL.
+
+**/app/api/download/route.ts**
+
+* Check purchase; return signed full MP3 URL.
+
+---
+
+## Default UX copy & CTAs
+
+* Hero: “Turn trash talk into an **anthem**.”
+* Button: “Make My Anthem”
+* Preview panel: “Here’s your 15-second smack-talk teaser.”
+* Pay CTA: “Get the Full Song – \$3.99”
+
+---
+
+## Testing checklist
+
+* OCR parses typical ESPN/Yahoo/Sleeper roster screenshots (include 2–3 sample fixtures under `/public/fixtures`).
+* Editable roster confirmation UI catches OCR misses.
+* End-to-end: create job → preview ready ≤ 90s (with mock Suno) → Stripe test mode → download full MP3.
+
+---
+
+## Notes for the AI building the repo
+
+* Where a 3rd-party API (Suno) isn’t publicly documented, **stub with a clear interface** plus a `DEV_MOCK_SUNO=1` switch that uses a royalty-free sample MP3 so the app runs locally.
+* Ensure all pages handle loading/error gracefully with animated placeholders.
+* Provide a `README.md` with:
+
+  * env setup
+  * Supabase+Stripe setup steps
+  * how to run the BullMQ worker on Replit (`node dist/queue/worker.js`)
+  * how to enable mock mode
+  * known limitations
+
+---
+
+If you want, I can also generate the **exact prompt template variations** per genre/tone/PG-NSFW and the **position-aware line library** so your lyrics always feel tailored while covering every starter.
